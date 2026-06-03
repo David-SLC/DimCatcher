@@ -5,7 +5,6 @@ from PIL import Image
 import io
 import re
 import pandas as pd
-import concurrent.futures
 import os
 from fpdf import FPDF
 
@@ -112,7 +111,7 @@ def create_pdf_report(df):
         pdf.cell(95, 10, str(row['Dimensions (LxWxH)']), border=1, align="C")
         pdf.cell(95, 10, str(row['Total Quantity']), border=1, align="C", new_x="LMARGIN", new_y="NEXT")
         
-    return bytes(pdf.output()) # Fix: Converted bytearray to standard bytes
+    return bytes(pdf.output())
 
 # --- Streamlit UI ---
 
@@ -128,7 +127,6 @@ if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     
     try:
-        # Initialize Scanner
         with st.spinner("Initializing scanner..."):
             initial_doc = fitz.open(stream=file_bytes, filetype="pdf")
             num_pages = len(initial_doc)
@@ -140,21 +138,17 @@ if uploaded_file is not None:
         dimensions_tally = {}
         pages_found = 0
         pages_skipped = 0
-        
         results = []
-        max_threads = os.cpu_count() or 4
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
-            futures = [executor.submit(process_page, p, file_bytes) for p in range(num_pages)]
+        # Single-threaded processing to respect free-tier CPU limits
+        for p in range(num_pages):
+            res = process_page(p, file_bytes)
+            results.append(res)
             
-            completed = 0
-            for future in concurrent.futures.as_completed(futures):
-                results.append(future.result())
-                completed += 1
-                
-                # Update progress bar in real-time
-                percentage = int((completed / num_pages) * 100)
-                progress_bar.progress(completed / num_pages, text=f"Scanning labels... {percentage}% ({completed}/{num_pages} pages)")
+            # Update progress bar in real-time
+            completed = p + 1
+            percentage = int((completed / num_pages) * 100)
+            progress_bar.progress(completed / num_pages, text=f"Scanning labels... {percentage}% ({completed}/{num_pages} pages)")
                 
         # Process Results
         for res in results:
@@ -167,7 +161,7 @@ if uploaded_file is not None:
                 
         # Final Output Validation
         if dimensions_tally:
-            progress_bar.empty() # Remove the progress bar from the screen when done
+            progress_bar.empty() 
             st.success(f"Success! Processed {pages_found} labels. ({pages_skipped} pages skipped)")
             
             df = pd.DataFrame(list(dimensions_tally.items()), columns=['Dimensions (LxWxH)', 'Total Quantity'])

@@ -5,6 +5,7 @@ from PIL import Image
 import io
 import re
 import pandas as pd
+import concurrent.futures
 import os
 from fpdf import FPDF
 
@@ -49,6 +50,7 @@ def parse_dimensions(text_snippet):
     return final_parts if len(final_parts) == 3 else None
 
 def process_page(page_num, file_bytes):
+    # Open doc inside the thread for safety
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     page = doc[page_num]
     text = page.get_text("text")
@@ -127,6 +129,7 @@ if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     
     try:
+        # Initialize Scanner
         with st.spinner("Initializing scanner..."):
             initial_doc = fitz.open(stream=file_bytes, filetype="pdf")
             num_pages = len(initial_doc)
@@ -138,17 +141,23 @@ if uploaded_file is not None:
         dimensions_tally = {}
         pages_found = 0
         pages_skipped = 0
+        
         results = []
         
-        # Single-threaded processing to respect free-tier CPU limits
-        for p in range(num_pages):
-            res = process_page(p, file_bytes)
-            results.append(res)
+        # Hard cap the workers at 4 to prevent Out of Memory crashes on Railway
+        max_threads = min(os.cpu_count() or 4, 4) 
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+            futures = [executor.submit(process_page, p, file_bytes) for p in range(num_pages)]
             
-            # Update progress bar in real-time
-            completed = p + 1
-            percentage = int((completed / num_pages) * 100)
-            progress_bar.progress(completed / num_pages, text=f"Scanning labels... {percentage}% ({completed}/{num_pages} pages)")
+            completed = 0
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+                completed += 1
+                
+                # Update progress bar in real-time
+                percentage = int((completed / num_pages) * 100)
+                progress_bar.progress(completed / num_pages, text=f"Scanning labels... {percentage}% ({completed}/{num_pages} pages)")
                 
         # Process Results
         for res in results:

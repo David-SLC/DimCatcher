@@ -50,8 +50,9 @@ def parse_dimensions(text_snippet):
     return final_parts if len(final_parts) == 3 else None
 
 def process_page(page_num, file_bytes):
-    # Open doc inside the thread for safety
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    # Deep copy/isolate bytes per thread to prevent data dropping
+    local_bytes = bytes(file_bytes)
+    doc = fitz.open(stream=local_bytes, filetype="pdf")
     page = doc[page_num]
     text = page.get_text("text")
     
@@ -93,21 +94,17 @@ def create_pdf_report(df):
     pdf = FPDF()
     pdf.add_page()
     
-    # Title
     pdf.set_font("helvetica", "B", 16)
     pdf.cell(0, 10, "DimCatcher - Daily Box Tally", align="C", new_x="LMARGIN", new_y="NEXT")
     
-    # Subtitle
     pdf.set_font("helvetica", "", 12)
     pdf.cell(0, 10, "Ranked by Volume (Largest to Smallest)", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(10)
     
-    # Table Header
     pdf.set_font("helvetica", "B", 12)
     pdf.cell(95, 10, "Dimensions (LxWxH)", border=1, align="C")
     pdf.cell(95, 10, "Total Quantity", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
     
-    # Table Data
     pdf.set_font("helvetica", "", 12)
     for index, row in df.iterrows():
         pdf.cell(95, 10, str(row['Dimensions (LxWxH)']), border=1, align="C")
@@ -122,45 +119,60 @@ st.set_page_config(page_title="DimCatcher", page_icon="📦")
 st.title("📦 DimCatcher")
 st.write("Upload your daily ShipStation labels below to extract and tally your box dimensions.")
 
-# Drag and Drop Uploader
 uploaded_file = st.file_uploader("Upload PDF file", type=["pdf"])
+
+# If a new file is uploaded, or the file changes, clear the old stored results
+if "last_uploaded_name" not in st.session_state:
+    st.session_state.last_uploaded_name = None
+
+if uploaded_file is not None and uploaded_file.name != st.session_state.last_uploaded_name:
+    st.session_state.scan_results = None
+    st.session_state.last_uploaded_name = uploaded_file.name
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     
-    try:
-        # Initialize Scanner
-        with st.spinner("Initializing scanner..."):
-            initial_doc = fitz.open(stream=file_bytes, filetype="pdf")
-            num_pages = len(initial_doc)
-            initial_doc.close()
+    # Check if we already have the scan saved in our session vault
+    if st.session_state.get("scan_results") is None:
+        try:
+            with st.spinner("Initializing scanner..."):
+                initial_doc = fitz.open(stream=file_bytes, filetype="pdf")
+                num_pages = len(initial_doc)
+                initial_doc.close()
+                
+            progress_bar = st.progress(0, text="Starting scan...")
+            results = []
             
-        # Setup Progress Bar
-        progress_bar = st.progress(0, text="Starting scan...")
-        
+            max_threads = min(os.cpu_count() or 4, 4) 
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+                futures = [executor.submit(process_page, p, file_bytes) for p in range(num_pages)]
+                
+                completed = 0
+                for future in concurrent.futures.as_completed(futures):
+                    results.append(future.result())
+                    completed += 1
+                    percentage = int((completed / num_pages) * 100)
+                    progress_bar.progress(completed / num_pages, text=f"Scanning labels... {percentage}% ({completed}/{num_pages} pages)")
+            
+            progress_bar.empty()
+            # Save the raw results to session state so it never repeats on button clicks
+            st.session_state.scan_results = results
+
+        except Exception as e:
+            st.error("An error occurred while processing the file.")
+            with st.expander("Show error details"):
+                st.write(e)
+            st.session_state.scan_results = None
+
+    # Process and display results if they exist in the vault
+    if st.session_state.get("scan_results") is not None:
+        saved_results = st.session_state.scan_results
         dimensions_tally = {}
         pages_found = 0
         pages_skipped = 0
         
-        results = []
-        
-        # Hard cap the workers at 4 to prevent Out of Memory crashes on Railway
-        max_threads = min(os.cpu_count() or 4, 4) 
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
-            futures = [executor.submit(process_page, p, file_bytes) for p in range(num_pages)]
-            
-            completed = 0
-            for future in concurrent.futures.as_completed(futures):
-                results.append(future.result())
-                completed += 1
-                
-                # Update progress bar in real-time
-                percentage = int((completed / num_pages) * 100)
-                progress_bar.progress(completed / num_pages, text=f"Scanning labels... {percentage}% ({completed}/{num_pages} pages)")
-                
-        # Process Results
-        for res in results:
+        for res in saved_results:
             if res['status'] == 'not_found' or res['status'] == 'skipped_slip':
                 pages_skipped += 1
             elif res['status'] == 'found':
@@ -168,9 +180,7 @@ if uploaded_file is not None:
                 dim = res['dim']
                 dimensions_tally[dim] = dimensions_tally.get(dim, 0) + 1
                 
-        # Final Output Validation
         if dimensions_tally:
-            progress_bar.empty() 
             st.success(f"Success! Processed {pages_found} labels. ({pages_skipped} pages skipped)")
             
             df = pd.DataFrame(list(dimensions_tally.items()), columns=['Dimensions (LxWxH)', 'Total Quantity'])
@@ -178,7 +188,8 @@ if uploaded_file is not None:
             df = df.sort_values(by='Volume', ascending=False)
             df = df.drop(columns=['Volume'])
             
-            # Generate PDF byte output
+            st.dataframe(df, use_container_width=True)
+            
             pdf_bytes = create_pdf_report(df)
             
             st.download_button(
@@ -188,10 +199,4 @@ if uploaded_file is not None:
                 mime="application/pdf"
             )
         else:
-            progress_bar.empty()
             st.error("Uh oh! No dimensions were found in this document.")
-
-    except Exception as e:
-        st.error("An error occurred while processing the file. Please ensure it is a valid PDF and try again.")
-        with st.expander("Show error details"):
-            st.write(e)

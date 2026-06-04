@@ -7,6 +7,7 @@ import re
 import pandas as pd
 import concurrent.futures
 import os
+import tempfile
 from fpdf import FPDF
 
 # --- Core Functions ---
@@ -49,10 +50,9 @@ def parse_dimensions(text_snippet):
 
     return final_parts if len(final_parts) == 3 else None
 
-def process_page(page_num, file_bytes):
-    # Deep copy/isolate bytes per thread to prevent data dropping
-    local_bytes = bytes(file_bytes)
-    doc = fitz.open(stream=local_bytes, filetype="pdf")
+def process_page(page_num, filepath):
+    # Open doc from the physical disk, safely isolated per thread
+    doc = fitz.open(filepath)
     page = doc[page_num]
     text = page.get_text("text")
     
@@ -121,7 +121,6 @@ st.write("Upload your daily ShipStation labels below to extract and tally your b
 
 uploaded_file = st.file_uploader("Upload PDF file", type=["pdf"])
 
-# If a new file is uploaded, or the file changes, clear the old stored results
 if "last_uploaded_name" not in st.session_state:
     st.session_state.last_uploaded_name = None
 
@@ -130,13 +129,16 @@ if uploaded_file is not None and uploaded_file.name != st.session_state.last_upl
     st.session_state.last_uploaded_name = uploaded_file.name
 
 if uploaded_file is not None:
-    file_bytes = uploaded_file.read()
-    
     # Check if we already have the scan saved in our session vault
     if st.session_state.get("scan_results") is None:
         try:
             with st.spinner("Initializing scanner..."):
-                initial_doc = fitz.open(stream=file_bytes, filetype="pdf")
+                # Save the uploaded file to a physical temporary file on the server
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                    tmp_file.write(uploaded_file.read())
+                    tmp_file_path = tmp_file.name
+
+                initial_doc = fitz.open(tmp_file_path)
                 num_pages = len(initial_doc)
                 initial_doc.close()
                 
@@ -146,7 +148,8 @@ if uploaded_file is not None:
             max_threads = min(os.cpu_count() or 4, 4) 
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
-                futures = [executor.submit(process_page, p, file_bytes) for p in range(num_pages)]
+                # Pass the physical file path to the workers instead of bytes
+                futures = [executor.submit(process_page, p, tmp_file_path) for p in range(num_pages)]
                 
                 completed = 0
                 for future in concurrent.futures.as_completed(futures):
@@ -156,8 +159,11 @@ if uploaded_file is not None:
                     progress_bar.progress(completed / num_pages, text=f"Scanning labels... {percentage}% ({completed}/{num_pages} pages)")
             
             progress_bar.empty()
-            # Save the raw results to session state so it never repeats on button clicks
             st.session_state.scan_results = results
+            
+            # Clean up: Delete the temporary file from the server
+            if os.path.exists(tmp_file_path):
+                os.remove(tmp_file_path)
 
         except Exception as e:
             st.error("An error occurred while processing the file.")
@@ -200,4 +206,3 @@ if uploaded_file is not None:
             )
         else:
             st.error("Uh oh! No dimensions were found in this document.")
-# Triggering a fresh rebuild
